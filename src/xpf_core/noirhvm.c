@@ -1740,16 +1740,22 @@ bool nvc_translate_host_virtual_address_routine64(u64 pt,u64 va,u32 level,u64p p
 	// Check permission.
 	// nvd_printf("[Translate] VA: 0x%p, Level: %u, Shift-Diff: %u, Page-Table: 0x%p, Page-Index: 0x%X\n",va,level,shift_diff,pt,index);
 	pf_err->value=0;
-	pf_err->present=table[index].present<r;
+	// Check if page is present first - this must be checked at all levels!
+	if(!table[index].present)
+	{
+		pf_err->present=1;
+		nvd_printf("[Translate] Page not present at level %u! VA=0x%llX, Index=%llu\n",level,va,index);
+		return false;
+	}
 	pf_err->write=table[index].write<w;
 	pf_err->user=table[index].user<u;
 	pf_err->execute=table[index].no_execute>x;
-	if(pf_err->value && level==1)
+	if(pf_err->value)
 	{
 		nvd_printf("[Translate] Permission is not granted at level %u! #PF Error: 0x%X\n",level,pf_err->value);
 		return false;
 	}
-	else
+	// Permission is granted.
 	{
 		// Permission is granted.
 		if(level>1)

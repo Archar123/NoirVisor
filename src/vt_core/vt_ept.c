@@ -120,6 +120,10 @@ update_pdpte:
 		ia32_ept_pdpte_p pdpte_p=(ia32_ept_pdpte_p)&eptm->pdpt.virt[index];
 		pdpte_p->reserved0=0;
 		pdpte_p->pde_offset=page_4kb_count(pde_p->phys);
+		// IMPORTANT: Set permission bits, otherwise EPT Violation will occur!
+		pdpte_p->read=1;
+		pdpte_p->write=1;
+		pdpte_p->execute=1;
 	}
 	return pde_p;
 }
@@ -192,6 +196,10 @@ update_pde:
 			const u64 pde_index=page_entry_index64(pfn_index);
 			pde_p->virt[pde_index].reserved0=0;
 			pde_p->virt[pde_index].pte_offset=page_4kb_count(pte_p->phys);
+			// IMPORTANT: Set permission bits, otherwise EPT Violation will occur!
+			pde_p->virt[pde_index].read=1;
+			pde_p->virt[pde_index].write=1;
+			pde_p->virt[pde_index].execute=1;
 		}
 	}
 	return pte_p;
@@ -388,8 +396,10 @@ void static nvc_ept_update_per_var_mtrr(noir_ept_manager_p eptm,u32 mtrr_msr_ind
 	{
 		ia32_mtrr_phys_base_msr phys_base;
 		phys_base.value=noir_rdmsr(mtrr_msr_index);
-		// Ignore MTRRs that defines the same memory type as default MTRR.
-		if(phys_base.type!=eptm->def_type.type)
+		// NOTE: Do NOT ignore MTRRs even if they have the same type as default MTRR.
+		// We need to process all MTRRs to handle "hole punching" scenarios where
+		// a UC MTRR overrides a previous WB MTRR covering the same region.
+		// if(phys_base.type!=eptm->def_type.type)
 		{
 			u32 exponential;
 			u64 len=0,increment=0,base=page_mult(phys_base.phys_base);
@@ -662,6 +672,10 @@ bool nvc_ept_protect_hypervisor(noir_hypervisor_p hvm,noir_ept_manager_p eptm)
 */
 noir_ept_manager_p nvc_ept_build_identity_map()
 {
+	ia32_vmx_ept_vpid_cap_msr ept_cap;
+	ept_cap.value = noir_rdmsr(ia32_vmx_ept_vpid_cap);
+	nv_dprintf("EPT Capabilities: 0x%llX, 1GB Support: %d\n", ept_cap.value, ept_cap.support_1gb_paging);
+
 	bool alloc_success=false;
 	// Allocate structures for EPT Manager.
 #if defined(_hv_type1)
@@ -694,19 +708,69 @@ noir_ept_manager_p nvc_ept_build_identity_map()
 		// Although unlikely to happen, MTRRs can be disabled.
 		// If disabled, default memory type is uncacheable.
 		if(eptm->def_type.enabled)def_type=eptm->def_type.type;
+		else def_type = ia32_uncacheable; // 0 //def_type=ia32_write_back;
+
+		u32 max_1gb_pages = 0;
+        if(eptm->phys_addr_size > 30)
+             max_1gb_pages = 1 << (eptm->phys_addr_size - 30);
+        else
+             max_1gb_pages = 1; 
+
 		for(u32 i=0;i<512;i++)
 		{
 			for(u32 j=0;j<512;j++)
 			{
 				const u32 k=(i<<9)+j;
-				// Build Page-Directory-Pointer-Table Entries (PDPTEs)
-				eptm->pdpt.virt[k].value=0;
-				eptm->pdpt.virt[k].page_offset=k;
-				eptm->pdpt.virt[k].read=1;
-				eptm->pdpt.virt[k].write=1;
-				eptm->pdpt.virt[k].execute=1;
-				eptm->pdpt.virt[k].huge_pdpte=1;
-				eptm->pdpt.virt[k].memory_type=def_type;
+                if(k < max_1gb_pages)
+                {
+					// Build Page-Directory-Pointer-Table Entries (PDPTEs)
+					if(ept_cap.support_1gb_paging)
+					{
+						eptm->pdpt.virt[k].value=0;
+						eptm->pdpt.virt[k].page_offset=k;
+						eptm->pdpt.virt[k].read=1;
+						eptm->pdpt.virt[k].write=1;
+						eptm->pdpt.virt[k].execute=1;
+						eptm->pdpt.virt[k].huge_pdpte=1;
+						eptm->pdpt.virt[k].memory_type=def_type;
+					}
+					else
+					{
+						// Fallback: Use 2MB pages (PDEs) if 1GB is not supported
+						u64 gpa_base = (u64)k << 30;
+						noir_ept_pde_descriptor_p pde_p = nvc_ept_split_pdpte(eptm, gpa_base, true, true);
+						if (!pde_p)
+						{
+							nv_dprintf("Failed to allocate PDE for 1GB fallback at GPA 0x%llX\n", gpa_base);
+							goto alloc_failure;
+						}
+						
+						// Now populate the 512 PDEs in this table as 2MB pages
+						for (u32 m = 0; m < 512; m++)
+						{
+							u64 cur_gpa = gpa_base + ((u64)m << 21);
+							// Use nvc_ept_update_pde to set the entry. 
+                            // It handles the details of large_pde bit and address translation.
+                            // However, we can also manually set it since we have access to the descriptor.
+                            // Manual setting is faster and avoids re-traversal.
+							
+                            // Ensure the PDE descriptor's virtual address is valid
+                            // Note: nvc_ept_split_pdpte allocates pde_p->virt.
+                            
+                            pde_p->large[m].value = 0;
+                            pde_p->large[m].page_offset = page_2mb_count(cur_gpa);
+                            pde_p->large[m].read = 1;
+                            pde_p->large[m].write = 1;
+                            pde_p->large[m].execute = 1;
+                            pde_p->large[m].large_pde = 1; // Must be 1 for 2MB page
+                            pde_p->large[m].memory_type = def_type;
+						}
+					}
+                }
+                else
+                {
+                    eptm->pdpt.virt[k].value=0;
+                }
 			}
 			// Build Page-Map-Level-4 Entries (PML4Es)
 			eptm->eptp.virt[i].value=0;
